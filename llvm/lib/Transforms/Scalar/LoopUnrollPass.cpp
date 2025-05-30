@@ -23,6 +23,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopPass.h"
@@ -1602,6 +1603,7 @@ PreservedAnalyses LoopUnrollPass::run(Function &F,
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   auto &ORE = AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
+  LazyValueInfo &LVI = AM.getResult<LazyValueAnalysis>(F);
   AAResults &AA = AM.getResult<AAManager>(F);
 
   LoopAnalysisManager *LAM = nullptr;
@@ -1649,17 +1651,21 @@ PreservedAnalyses LoopUnrollPass::run(Function &F,
     if (PSI && PSI->hasHugeWorkingSetSize())
       LocalAllowPeeling = false;
     std::string LoopName = std::string(L.getName());
+    LoopUnrollResult Result =
+        tryUnrollLoopIntoSwitch(L, LVI, SE, LI, DT, /*PreserveLCSSA*/ true);
+
     // The API here is quite complex to call and we allow to select some
     // flavors of unrolling during construction time (by setting UnrollOpts).
-    LoopUnrollResult Result = tryToUnrollLoop(
-        &L, DT, &LI, SE, TTI, AC, ORE, BFI, PSI,
-        /*PreserveLCSSA*/ true, UnrollOpts.OptLevel, /*OnlyFullUnroll*/ false,
-        UnrollOpts.OnlyWhenForced, UnrollOpts.ForgetSCEV,
-        /*Count*/ std::nullopt,
-        /*Threshold*/ std::nullopt, UnrollOpts.AllowPartial,
-        UnrollOpts.AllowRuntime, UnrollOpts.AllowUpperBound, LocalAllowPeeling,
-        UnrollOpts.AllowProfileBasedPeeling, UnrollOpts.FullUnrollMaxCount,
-        &AA);
+    if (Result == LoopUnrollResult::Unmodified)
+      Result = tryToUnrollLoop(
+          &L, DT, &LI, SE, TTI, AC, ORE, BFI, PSI,
+          /*PreserveLCSSA*/ true, UnrollOpts.OptLevel, /*OnlyFullUnroll*/ false,
+          UnrollOpts.OnlyWhenForced, UnrollOpts.ForgetSCEV,
+          /*Count*/ std::nullopt,
+          /*Threshold*/ std::nullopt, UnrollOpts.AllowPartial,
+          UnrollOpts.AllowRuntime, UnrollOpts.AllowUpperBound,
+          LocalAllowPeeling, UnrollOpts.AllowProfileBasedPeeling,
+          UnrollOpts.FullUnrollMaxCount, &AA);
     Changed |= Result != LoopUnrollResult::Unmodified;
 
     // The parent must not be damaged by unrolling!

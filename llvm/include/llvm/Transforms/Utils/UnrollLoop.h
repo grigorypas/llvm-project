@@ -17,7 +17,9 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Analysis/CodeMetrics.h"
+#include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/Support/InstructionCost.h"
 
 namespace llvm {
@@ -113,6 +115,16 @@ void simplifyLoopAfterUnroll(Loop *L, bool SimplifyIVs, LoopInfo *LI,
                              AAResults *AA = nullptr);
 
 MDNode *GetUnrollMetadata(MDNode *LoopID, StringRef Name);
+LoopUnrollResult tryUnrollLoopIntoSwitch(Loop &L, LazyValueInfo &LVI,
+                                         ScalarEvolution &SE, LoopInfo &LI,
+                                         DominatorTree &DT,
+                                         bool ForgetAllSCEV = false);
+LoopUnrollResult UnrollLoopIntoSwitch(
+    Loop &L, unsigned UnrollCount, Value *SwitchValue,
+    ConstantInt *FirstSwitchValue,
+    std::function<ConstantInt *(ConstantInt *)> nextSwitchValue,
+    ScalarEvolution &SE, LoopInfo &LI, DominatorTree &DT,
+    bool ForgetAllSCEV = false);
 
 TargetTransformInfo::UnrollingPreferences gatherUnrollingPreferences(
     Loop *L, ScalarEvolution &SE, const TargetTransformInfo &TTI,
