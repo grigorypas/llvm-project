@@ -30,21 +30,147 @@ using namespace llvm;
 
 namespace {
 
+class InlinerHelper {
+  Module &M;
+  ProfileSummaryInfo &PSI;
+  FunctionAnalysisManager *FAM;
+  function_ref<AssumptionCache &(Function &)> GetAssumptionCache;
+  function_ref<AAResults &(Function &)> GetAAR;
+  bool InsertLifetime;
+
+  SmallSetVector<Function *, 16> MaybeInlinedFunctions;
+
+public:
+  InlinerHelper(Module &M, ProfileSummaryInfo &PSI,
+                FunctionAnalysisManager *FAM,
+                function_ref<AssumptionCache &(Function &)> GetAssumptionCache,
+                function_ref<AAResults &(Function &)> GetAAR,
+                bool InsertLifetime)
+      : M(M), PSI(PSI), FAM(FAM), GetAssumptionCache(GetAssumptionCache),
+        GetAAR(GetAAR), InsertLifetime(InsertLifetime) {}
+
+  bool canInline(Function &F) {
+    return !F.isPresplitCoroutine() && !F.isDeclaration() &&
+           isInlineViable(F).isSuccess();
+  }
+
+  bool tryInline(CallBase &CB, StringRef InlignReason) {
+    Function &Callee = *CB.getCalledFunction();
+    Function *Caller = CB.getCaller();
+    OptimizationRemarkEmitter ORE(Caller);
+    DebugLoc DLoc = CB.getDebugLoc();
+    BasicBlock *Block = CB.getParent();
+
+    InlineFunctionInfo IFI(GetAssumptionCache, &PSI, nullptr, nullptr);
+    InlineResult Res = InlineFunction(CB, IFI, /*MergeAttributes=*/true,
+                                      &GetAAR(Callee), InsertLifetime);
+    if (!Res.isSuccess()) {
+      ORE.emit([&]() {
+        return OptimizationRemarkMissed(DEBUG_TYPE, "NotInlined", DLoc, Block)
+               << "'" << ore::NV("Callee", &Callee) << "' is not inlined into '"
+               << ore::NV("Caller", Caller)
+               << "': " << ore::NV("Reason", Res.getFailureReason());
+      });
+      return false;
+      ;
+    }
+
+    emitInlinedIntoBasedOnCost(ORE, DLoc, Block, Callee, *Caller,
+                               InlineCost::getAlways(InlignReason.data()),
+                               /*ForProfileContext=*/false, DEBUG_TYPE);
+    if (FAM)
+      FAM->invalidate(*Caller, PreservedAnalyses::none());
+    return true;
+  }
+
+  void addToMaybeInlinedFunctions(Function &F) {
+    MaybeInlinedFunctions.insert(&F);
+  }
+
+  bool postInlinerCleanup() {
+    SmallVector<Function *, 16> InlinedComdatFunctions;
+    bool Changed = false;
+    for (Function *F : MaybeInlinedFunctions) {
+      F->removeDeadConstantUsers();
+      if (F->hasFnAttribute(Attribute::AlwaysInline) &&
+          F->isDefTriviallyDead()) {
+        if (F->hasComdat()) {
+          InlinedComdatFunctions.push_back(F);
+        } else {
+          if (FAM)
+            FAM->clear(*F, F->getName());
+          M.getFunctionList().erase(F);
+          Changed = true;
+        }
+      }
+    }
+    if (!InlinedComdatFunctions.empty()) {
+      // Now we just have the comdat functions. Filter out the ones whose
+      // comdats are not actually dead.
+      filterDeadComdatFunctions(InlinedComdatFunctions);
+      // The remaining functions are actually dead.
+      for (Function *F : InlinedComdatFunctions) {
+        if (FAM)
+          FAM->clear(*F, F->getName());
+        M.getFunctionList().erase(F);
+        Changed = true;
+      }
+    }
+    return Changed;
+  }
+};
+
+bool flattenFunction(Function &F, InlinerHelper &IH) {
+  bool Changed = true;
+  uint64_t MaxDepth = F.getFnAttribute(Attribute::FlattenDeep).getValueAsInt();
+  assert(MaxDepth > 0 && "MaxDepth must be positive");
+  SmallVector<CallBase *, 16> Calls;
+  while (MaxDepth && Changed) {
+    Changed = false;
+    MaxDepth--;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB->getAttributes().hasFnAttr(Attribute::NoInline))
+            continue;
+          Function *Callee = CB->getCalledFunction();
+          if (!Callee)
+            continue;
+          if (!IH.canInline(*Callee)) {
+            continue;
+          }
+          Calls.push_back(CB);
+          IH.addToMaybeInlinedFunctions(*Callee);
+        }
+      }
+    }
+    for (CallBase *CB : Calls) {
+      Changed |= IH.tryInline(*CB, "flatten_deep attribute");
+    }
+    Calls.clear();
+  }
+  return Changed;
+}
+
 bool AlwaysInlineImpl(
     Module &M, bool InsertLifetime, ProfileSummaryInfo &PSI,
     FunctionAnalysisManager *FAM,
     function_ref<AssumptionCache &(Function &)> GetAssumptionCache,
     function_ref<AAResults &(Function &)> GetAAR) {
   SmallSetVector<CallBase *, 16> Calls;
+  InlinerHelper IH(M, PSI, FAM, GetAssumptionCache, GetAAR, InsertLifetime);
+  SmallVector<Function *, 4> NeedFlattening;
+
   bool Changed = false;
   SmallVector<Function *, 16> InlinedComdatFunctions;
 
   for (Function &F : make_early_inc_range(M)) {
-    if (F.isPresplitCoroutine())
-      continue;
+    if (F.hasFnAttribute(Attribute::FlattenDeep))
+      NeedFlattening.push_back(&F);
 
-    if (F.isDeclaration() || !isInlineViable(F).isSuccess())
+    if (!IH.canInline(F))
       continue;
+    IH.addToMaybeInlinedFunctions(F);
 
     Calls.clear();
 
@@ -56,62 +182,13 @@ bool AlwaysInlineImpl(
           Calls.insert(CB);
 
     for (CallBase *CB : Calls) {
-      Function *Caller = CB->getCaller();
-      OptimizationRemarkEmitter ORE(Caller);
-      DebugLoc DLoc = CB->getDebugLoc();
-      BasicBlock *Block = CB->getParent();
-
-      InlineFunctionInfo IFI(GetAssumptionCache, &PSI, nullptr, nullptr);
-      InlineResult Res = InlineFunction(*CB, IFI, /*MergeAttributes=*/true,
-                                        &GetAAR(F), InsertLifetime);
-      if (!Res.isSuccess()) {
-        ORE.emit([&]() {
-          return OptimizationRemarkMissed(DEBUG_TYPE, "NotInlined", DLoc, Block)
-                 << "'" << ore::NV("Callee", &F) << "' is not inlined into '"
-                 << ore::NV("Caller", Caller)
-                 << "': " << ore::NV("Reason", Res.getFailureReason());
-        });
-        continue;
-      }
-
-      emitInlinedIntoBasedOnCost(
-          ORE, DLoc, Block, F, *Caller,
-          InlineCost::getAlways("always inline attribute"),
-          /*ForProfileContext=*/false, DEBUG_TYPE);
-
-      Changed = true;
-      if (FAM)
-        FAM->invalidate(*Caller, PreservedAnalyses::none());
-    }
-
-    F.removeDeadConstantUsers();
-    if (F.hasFnAttribute(Attribute::AlwaysInline) && F.isDefTriviallyDead()) {
-      // Remember to try and delete this function afterward. This allows to call
-      // filterDeadComdatFunctions() only once.
-      if (F.hasComdat()) {
-        InlinedComdatFunctions.push_back(&F);
-      } else {
-        if (FAM)
-          FAM->clear(F, F.getName());
-        M.getFunctionList().erase(F);
-        Changed = true;
-      }
+      Changed |= IH.tryInline(*CB, "always inline attribute");
     }
   }
+  for (Function *F : NeedFlattening)
+    Changed |= flattenFunction(*F, IH);
 
-  if (!InlinedComdatFunctions.empty()) {
-    // Now we just have the comdat functions. Filter out the ones whose comdats
-    // are not actually dead.
-    filterDeadComdatFunctions(InlinedComdatFunctions);
-    // The remaining functions are actually dead.
-    for (Function *F : InlinedComdatFunctions) {
-      if (FAM)
-        FAM->clear(*F, F->getName());
-      M.getFunctionList().erase(F);
-      Changed = true;
-    }
-  }
-
+  Changed |= IH.postInlinerCleanup();
   return Changed;
 }
 
