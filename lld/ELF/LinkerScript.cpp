@@ -42,7 +42,7 @@ using namespace llvm::support::endian;
 using namespace lld;
 using namespace lld::elf;
 
-static bool isSectionPrefix(StringRef prefix, StringRef name) {
+bool elf::isSectionPrefix(StringRef prefix, StringRef name) {
   return name.consume_front(prefix) && (name.empty() || name[0] == '.');
 }
 

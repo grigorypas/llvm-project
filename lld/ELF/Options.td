@@ -171,6 +171,10 @@ defm debug_names: BB<"debug-names",
     "Generate a merged .debug_names section",
     "Do not generate a merged .debug_names section (default)">;
 
+def x86_64_demote_large_sections_by_relocs:
+  FF<"x86-64-demote-large-sections-by-relocs">,
+  HelpText<"Demote x86-64 large sections referenced by 32-bit relocations">;
+
 defm default_script: EEq<"default-script", "In the absence of --script, read this default linker script">;
 
 defm demangle: B<"demangle",

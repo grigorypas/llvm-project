@@ -2687,6 +2687,159 @@ static void replaceCommonSymbols(Ctx &ctx) {
   }
 }
 
+// Clear SHF_X86_64_LARGE and replace a known large prefix with its small one.
+static void demoteLargeSection(Ctx &ctx, InputSectionBase &sec) {
+  static constexpr std::pair<StringRef, StringRef> prefixes[] = {
+      {".ltext", ".text"},
+      {".lrodata", ".rodata"},
+      {".ldata", ".data"},
+      {".lbss", ".bss"},
+  };
+  sec.flags &= ~(uint64_t)SHF_X86_64_LARGE;
+  for (auto [large, small] : prefixes)
+    if (isSectionPrefix(large, sec.name)) {
+      sec.name = ctx.saver.save(Twine(small) + sec.name.substr(large.size()));
+      break;
+    }
+}
+
+// A reference through a 32-bit field that no range-extension thunk can
+// redirect, which is anything but a call from code.
+static bool is32BitReference(const InputSectionBase &sec, RelType type) {
+  switch (type) {
+  case R_X86_64_PC32:
+  case R_X86_64_32:
+  case R_X86_64_32S:
+    return true;
+  case R_X86_64_PLT32:
+    return !(sec.flags & SHF_EXECINSTR);
+  default:
+    return false;
+  }
+}
+
+// A non-TLS access to the GOT, which stays small, through a 32-bit PC-relative
+// field.
+static bool isGotReference(RelType type) {
+  switch (type) {
+  case R_X86_64_GOTPC32:
+  case R_X86_64_GOTPCREL:
+  case R_X86_64_GOTPCRELX:
+  case R_X86_64_REX_GOTPCRELX:
+  case R_X86_64_CODE_4_GOTPCRELX:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Relocation scanning sees isPreemptible recomputed after lazy symbols and
+// symbols of unneeded DSOs become undefined and _TLS_MODULE_BASE_ is defined.
+static bool isPreemptibleAtScan(Ctx &ctx, const Symbol &sym) {
+  if (sym.isLazy() ||
+      (isa<SharedSymbol>(sym) && !cast<SharedFile>(sym.file)->isNeeded))
+    return sym.visibility() == STV_DEFAULT && ctx.arg.zDynamicUndefined;
+  if (sym.isUndefined() && sym.getName() == "_TLS_MODULE_BASE_")
+    return false;
+  return sym.isPreemptible;
+}
+
+// A TLS access not relaxed to Local-Exec reads a GOT entry through a 32-bit
+// PC-relative displacement.
+template <class RelTy>
+static bool needsTlsGotAccess(Ctx &ctx, const InputSectionBase &sec,
+                              RelType type, const RelTy &rel) {
+  switch (type) {
+  case R_X86_64_TLSLD:
+    return ctx.arg.shared;
+  case R_X86_64_TLSGD:
+  case R_X86_64_GOTTPOFF:
+  case R_X86_64_CODE_4_GOTTPOFF:
+  case R_X86_64_CODE_6_GOTTPOFF:
+  case R_X86_64_GOTPC32_TLSDESC:
+  case R_X86_64_CODE_4_GOTPC32_TLSDESC:
+    return ctx.arg.shared ||
+           isPreemptibleAtScan(ctx, sec.file->getRelocTargetSym(rel));
+  default:
+    return false;
+  }
+}
+
+using StartStopSections = StringMap<SmallVector<InputSectionBase *, 0>>;
+
+// Collect the large sections that must become small because sec reaches them
+// through a 32-bit field, or sec itself if it is large and has such a field.
+template <class ELFT, class Rels>
+static void
+collectSectionsToDemote(Ctx &ctx, const StartStopSections &startStop,
+                        InputSectionBase &sec,
+                        SmallVectorImpl<InputSectionBase *> &out, Rels rels) {
+  const bool isLarge = sec.flags & SHF_X86_64_LARGE;
+  bool sourceAdded = false;
+  for (const auto &rel : rels) {
+    RelType type = rel.getType(ctx.arg.isMips64EL);
+    bool is32Bit = is32BitReference(sec, type);
+    if (isLarge && !sourceAdded &&
+        (is32Bit || isGotReference(type) ||
+         needsTlsGotAccess(ctx, sec, type, rel))) {
+      out.push_back(&sec);
+      sourceAdded = true;
+    }
+    if (!is32Bit)
+      continue;
+    Symbol &sym = sec.file->getRelocTargetSym(rel);
+    auto *d = dyn_cast<Defined>(&sym);
+    if (!d) {
+      // __start_X and __stop_X get defined later, at the bounds of the
+      // sections named X.
+      StringRef name = sym.getName();
+      if (sym.isUndefined() &&
+          (name.consume_front("__start_") || name.consume_front("__stop_")))
+        if (auto it = startStop.find(name); it != startStop.end())
+          llvm::append_range(out, it->second);
+      continue;
+    }
+    // An ifunc is reached indirectly through its IPLT entry anyway.
+    if (d->isGnuIFunc())
+      continue;
+    auto *target = dyn_cast_or_null<InputSectionBase>(d->section);
+    if (target && target->isLive() && (target->flags & SHF_X86_64_LARGE) &&
+        !(target->flags & SHF_TLS))
+      out.push_back(target);
+  }
+}
+
+template <class ELFT> static void demoteLargeSectionsByRelocs(Ctx &ctx) {
+  // Most links have no large section, so check for one before scanning.
+  if (llvm::none_of(ctx.inputSections, [](InputSectionBase *sec) {
+        return (sec->flags & SHF_X86_64_LARGE) && sec->isLive();
+      }))
+    return;
+  llvm::TimeTraceScope timeScope("Demote large sections by relocations");
+  SmallVector<InputSectionBase *, 0> sources;
+  StartStopSections startStop;
+  for (InputSectionBase *sec : ctx.inputSections) {
+    if (!sec->isLive() || !(sec->flags & SHF_ALLOC))
+      continue;
+    sources.push_back(sec);
+    if ((sec->flags & SHF_X86_64_LARGE) && !(sec->flags & SHF_TLS) &&
+        isValidCIdentifier(sec->name))
+      startStop[sec->name].push_back(sec);
+  }
+  llvm::append_range(sources, ctx.ehInputSections);
+
+  SmallVector<SmallVector<InputSectionBase *, 0>, 0> found(sources.size());
+  parallelFor(0, sources.size(), [&](size_t i) {
+    invokeOnRelocs(*sources[i], collectSectionsToDemote<ELFT>, ctx, startStop,
+                   *sources[i], found[i]);
+  });
+
+  for (ArrayRef<InputSectionBase *> secs : found)
+    for (InputSectionBase *sec : secs)
+      if (sec->flags & SHF_X86_64_LARGE)
+        demoteLargeSection(ctx, *sec);
+}
+
 // The section referred to by `s` is considered address-significant. Set the
 // keepUnique flag on the section if appropriate.
 static void markAddrsig(bool icfSafe, Symbol *s) {
@@ -3582,6 +3735,10 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   markLive<ELFT>(ctx);
+
+  if (ctx.arg.emachine == EM_X86_64 && !ctx.arg.relocatable &&
+      args.hasArg(OPT_x86_64_demote_large_sections_by_relocs))
+    demoteLargeSectionsByRelocs<ELFT>(ctx);
 
   if (canHaveMemtagGlobals(ctx)) {
     llvm::TimeTraceScope timeScope("Process memory tagged symbols");

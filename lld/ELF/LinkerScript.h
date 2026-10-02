@@ -27,6 +27,8 @@
 
 namespace lld::elf {
 
+bool isSectionPrefix(StringRef prefix, StringRef name);
+
 class Defined;
 class InputFile;
 class InputSection;
